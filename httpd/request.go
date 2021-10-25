@@ -23,6 +23,8 @@ type Request struct {
 	conn *conn
 	cookies map[string]string	//存储cookies
 	queryString map[string]string //存储查询字符串
+	contentType string
+	boundary string
 }
 //公共方法获取查询字符串
 func (r *Request) Query(name string) string{
@@ -154,7 +156,7 @@ func (r *Request) finishRequest() (err error){
 }
 
 /**
-	这里主要解析url,header，cookie使用懒加载的方式，后续再处理
+	这里主要解析url,header，cookie则使用懒加载的方式，使用时再处理
  */
 func readRequest(c *conn) (*Request,error) {
 	r := new(Request)
@@ -181,6 +183,9 @@ func readRequest(c *conn) (*Request,error) {
 	if err != nil{
 		return nil, err
 	}
+
+	r.parseContentType()
+
 	const noLimit = (1 << 63)-1
 	r.conn.limitR.N = noLimit		//body的读取无需进行读取字符数限制
 	//设置body
@@ -231,4 +236,32 @@ func readHeader(bufr *bufio.Reader) (Header,error){
 		header[k] = append(header[k],v)
 	}
 	return header,nil
+}
+
+func (r *Request)parseContentType(){
+	ct := r.Header.Get("Content-Type")
+	//Content-Type: multipart/form-data; boundary=------974767299852498929531610575
+	//Content-Type: application/x-www-form-urlencoded
+	index := strings.IndexByte(ct,';')
+	if index == -1 {
+		r.contentType = ct
+	}
+
+	if index == len(ct)-1 {
+		return
+	}
+
+	ss := strings.Split(ct[index+1:],"=")
+	if len(ss) < 2 || strings.TrimSpace(ss[0]) != "boundary" {
+		return
+	}
+	r.contentType,r.boundary = ct[:index],strings.Trim(ss[1],"=")
+	return
+}
+
+func (r *Request) MultipartReader()(*MultipartReader,error){
+	if r.boundary==""{
+		return nil,errors.New("no boundary detected")
+	}
+	return NewMultipartReader(r.Body,r.boundary),nil
 }
