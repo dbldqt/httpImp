@@ -3,9 +3,11 @@ package httpd
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"os"
 	"strings"
 )
 
@@ -85,6 +87,103 @@ func (mr *MultipartReader) discardCRLF() (err error) {
 
 func (mr *MultipartReader) readLine() ([]byte, error) {
 	return readLine(mr.bufr)
+}
+
+func (mr *MultipartReader) ReadForm() (mf *MultipartForm,err error) {
+	mf = &MultipartForm{
+		Value: make(map[string]string),
+		File:  make(map[string]*FileHeader),
+	}
+
+	var part *Part
+	var nonFileMaxMemory int64 = 10 << 20	//非文件部分在内存中存取的最大量10MB,超出返回错误
+	var fileMaxMemory int64 = 30 << 20		//文件在内存中存取的最大量30MB,超出部分存储到硬盘
+
+	for {
+		part,err = mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+
+		if err != nil {
+			return
+		}
+
+		if part.FormName() == "" {
+			continue
+		}
+
+		var buff bytes.Buffer
+		var n int64
+		//non-file part
+		if part.FileName() == "" {
+			//copy的字节数未nonFileMaxMemory+1，好判断是否超过了内存大小限制
+			//如果err==io.EOF，则代表文本数据大小<nonFileMaxMemory+1，并未超过最大限制
+			n,err = io.CopyN(&buff,part,nonFileMaxMemory+1)
+			if err != nil && err != io.EOF {
+				return
+			}
+			nonFileMaxMemory -= n
+			if nonFileMaxMemory < 0 {
+				return nil, errors.New("multipart: message too large")
+			}
+			mf.Value[part.FormName()] = buff.String()
+			continue
+		}
+
+		//file part
+		n, err = io.CopyN(&buff, part, fileMaxMemory+1)
+		if err != nil && err != io.EOF {
+			return
+		}
+
+		fh := &FileHeader{
+			Filename: part.FileName(),
+			Header:   part.Header,
+		}
+
+		//未达到内存限制
+		if fileMaxMemory >= n {
+			fileMaxMemory -= n
+			fh.Size = int(n)
+			fh.content = buff.Bytes()
+			mf.File[part.FormName()] = fh
+			continue
+		}
+
+		//达到内存限制，将数据存入硬盘
+		var file *os.File
+		file, err = os.CreateTemp("", "multipart-")
+		if err != nil {
+			return
+		}
+		//将已经拷贝到buff里以及在part中还剩余的部分写入到硬盘
+		n, err = io.Copy(file, io.MultiReader(&buff, part))
+		if cerr := file.Close(); cerr != nil {
+			err = cerr
+		}
+		if err != nil {
+			os.Remove(file.Name())
+			return
+		}
+		fh.Size = int(n)
+		fh.tmpFile = file.Name()
+		mf_, ok := mf.File[part.FormName()]
+		if ok {
+			os.Remove(mf_.tmpFile)
+		}
+		mf.File[part.FormName()] = fh
+	}
+	return mf, nil
+}
+//硬盘上的暂时文件也应该在handler结束后删除，防止占用过多硬盘空间，我们提供一个将这些文件删除的方法
+func (mf *MultipartForm) RemoveAll() {
+	for _, fh := range mf.File {
+		if fh == nil || fh.tmpFile == "" {
+			continue
+		}
+		os.Remove(fh.tmpFile)
+	}
 }
 
 func (p *Part) readHeader() (err error) {

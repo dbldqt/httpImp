@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -25,6 +26,11 @@ type Request struct {
 	queryString map[string]string //存储查询字符串
 	contentType string
 	boundary string
+
+	postForm map[string]string
+	multipartForm *MultipartForm
+	haveParsedForm	bool
+	parseFormErr error
 }
 //公共方法获取查询字符串
 func (r *Request) Query(name string) string{
@@ -146,6 +152,10 @@ func (r *Request)chunked() bool{
 	所以我们的框架还需要在Handler结束后，将当前http请求的数据给消费掉。给Request增加一个finishRequest方法，以后的一些善尾工作都将交给它：
  */
 func (r *Request) finishRequest() (err error){
+	//用户获取MultipartForm之后，应该调用RemoveAll方法将暂存的文件删除。用户可能在Handler中忘记调用RemoveALL，因此我们在Request的finishRequest方法中做出防备
+	if r.multipartForm!=nil{
+		r.multipartForm.RemoveAll()
+	}
 	//将缓存中的剩余的数据发送到rwc中
 	if err=r.conn.bufw.Flush();err!=nil{
 		return
@@ -153,6 +163,18 @@ func (r *Request) finishRequest() (err error){
 	//消费掉剩余的数据
 	_,err = io.Copy(ioutil.Discard,r.Body)
 	return err
+}
+//文件的读取还是比较麻烦，用户还需要对MultipartForm的具体结构进行了解才能使用。我们对其简化：
+func (r *Request) FormFile(key string)(fh* FileHeader,err error){
+	mf,err := r.MultipartForm()
+	if err!=nil{
+		return
+	}
+	fh,ok:=mf.File[key]
+	if !ok{
+		return nil,errors.New("http: missing multipart file")
+	}
+	return
 }
 
 /**
@@ -265,3 +287,115 @@ func (r *Request) MultipartReader()(*MultipartReader,error){
 	}
 	return NewMultipartReader(r.Body,r.boundary),nil
 }
+
+func (r *Request) PostForm(name string) string {
+	if !r.haveParsedForm {
+		r.parseFormErr = r.parseForm()
+	}
+	if r.parseFormErr != nil  || r.postForm == nil {
+		return ""
+	}
+	return r.postForm[name]
+}
+
+func (r *Request) MultipartForm() (*MultipartForm,error) {
+	if !r.haveParsedForm {
+		if err := r.parseForm();err != nil {
+			r.parseFormErr = err
+			return nil,err
+		}
+	}
+	return r.multipartForm,r.parseFormErr
+}
+
+func (r *Request) parseForm() error{
+	if r.Method != "POST" && r.Method != "PUT" {
+		return errors.New("missing form body")
+	}
+
+	r.haveParsedForm = true
+	switch r.contentType {
+		case "application/x-www-form-urlencoded":
+			return r.parsePostForm()
+		case "multipart/form-data":
+			return r.parseMultipartForm()
+		default:
+			return errors.New("unsupported form type")
+	}
+}
+
+func (r *Request) parsePostForm() error {
+	data, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return err
+	}
+	r.postForm = parseQuery(string(data))
+	return nil
+}
+
+func (r *Request) parseMultipartForm() error {
+	mr,err := r.MultipartReader()
+	if err != nil{
+		return  err
+	}
+	r.multipartForm,err = mr.ReadForm()
+	//让PostForm方法也可以访问multipart表单的文本数据
+	r.postForm = r.multipartForm.Value
+	return nil
+}
+
+type MultipartForm struct {
+	Value map[string]string
+	File  map[string]*FileHeader
+}
+
+//由于multipart表单可以上传文件，文件可能会很大，如果把用户上传的文件全部缓存在内存里，
+//是极为消耗资源的。所以我们采取的机制是，规定一个内存里缓存最大量
+//如果当前缓存量未超过这个值，我们将这些数据存到content这个字节切片里去。
+//如果超过这个最大值，我们则将客户端上传文件的数据暂时存储到硬盘中去，待用户需要时再读取出来。tmpFile是这个暂时文件的路径。
+type FileHeader struct {
+	Filename string
+	Header   Header
+	Size     int
+	content  []byte
+	tmpFile  string
+}
+
+func (fh *FileHeader) Open() (io.ReadCloser,error) {
+	if fh.inDisk(){
+		//存储在硬盘上的情况，用户在读完这个文件之后有义务将这个文件关闭，所以我们的返回值是一个ReadCloser而不是单纯一个Reader。
+		return os.Open(fh.tmpFile)
+	}
+
+	b := bytes.NewReader(fh.content)
+	//对于存储在内存里的情况，我们将content切片转为一个bytes.Reader之后，并不需要Close方法，但为了保证编译通过，
+	//我们使用ioutil.NopCloser函数给我们的Reader添加一个什么都不做的Close方法，来保证一致性
+	return ioutil.NopCloser(b),nil
+}
+
+func (fh *FileHeader) inDisk() bool {
+	return fh.tmpFile != ""
+}
+
+//有很多时候，用户希望将客户端上传的文件保存到硬盘的某个位置。用户拿到一个FileHeader后，
+//还需要调用Open方法，Create一个文件，然后进行Copy，使用比较麻烦，我们给FileHeader增加一个Save方法：
+func (fh *FileHeader) Save(dest string)(err error){
+	rc,err:=fh.Open()
+	if err!=nil{
+		return
+	}
+	defer rc.Close()
+	file,err:=os.Create(dest)
+	if err!=nil{
+		return
+	}
+	defer file.Close()
+	_,err = io.Copy(file,rc)
+	if err!=nil{
+		os.Remove(dest)
+	}
+	return
+}
+
+
+

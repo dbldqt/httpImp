@@ -4,51 +4,76 @@ import (
 	"fmt"
 	"github.com/dbldqt/httpImp/httpd"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
 )
 
 type myHandler struct{}
 
-func (*myHandler) ServeHTTP(w httpd.ResponseWriter, r *httpd.Request) {
-	mr, err := r.MultipartReader()
+//测试FormFile
+func handleTest1(w httpd.ResponseWriter, r *httpd.Request) (err error) {
+	fh, err := r.FormFile("file1")
 	if err != nil {
-		log.Println(err)
 		return
 	}
-	var part *httpd.Part
-label:
-	for {
-		part, err = mr.NextPart()
-		if err != nil {
-			break
-		}
-		switch part.FileName() {
-		case "":
-			fmt.Printf("FormName=%s, FormData:\n", part.FormName())
-			if _, err = io.Copy(os.Stdout, part); err != nil {
-				break label
-			}
-			fmt.Println()
-		default:
-			fmt.Printf("FormName=%s, FileName=%s\n", part.FormName(), part.FileName())
-			var file *os.File
-			if file, err = os.Create(part.FileName()); err != nil {
-				break label
-			}
-			if _, err = io.Copy(file, part); err != nil {
-				file.Close()
-				break label
-			}
-			file.Close()
-		}
+	rc, err := fh.Open()
+	if err != nil {
+		return
 	}
-	if err != io.EOF {
+	defer rc.Close()
+	buf, err := ioutil.ReadAll(rc)
+	if err != nil {
+		return
+	}
+	fmt.Printf("%s\n", buf)
+	return
+}
+
+//测试Save
+func handleTest2(w httpd.ResponseWriter, r *httpd.Request) (err error) {
+	mr, err := r.MultipartForm()
+	if err != nil {
+		return
+	}
+	for _, fh := range mr.File {
+		err = fh.Save(fh.Filename)
+	}
+	return err
+}
+
+//测试PostForm
+func handleTest3(w httpd.ResponseWriter, r *httpd.Request) (err error) {
+	value1 := r.PostForm("foo1")
+	value2 := r.PostForm("foo2")
+	fmt.Printf("foo1=%s,foo2=%s\n", value1, value2)
+	return nil
+}
+
+func (*myHandler) ServeHTTP(w httpd.ResponseWriter, r *httpd.Request) {
+	var err error
+	switch r.Url.Path {
+	case "/test1":
+		err = handleTest1(w, r)
+	case "/test2":
+		err = handleTest2(w, r)
+	case "/test3":
+		err = handleTest3(w, r)
+	}
+	if err != nil {
 		fmt.Println(err)
 	}
 	io.WriteString(w, "HTTP/1.1 200 OK\r\n")
 	io.WriteString(w, fmt.Sprintf("Content-Length: %d\r\n", 0))
 	io.WriteString(w, "\r\n")
+}
+
+func main() {
+	svr := &httpd.Server{
+		Addr:    "127.0.0.1:80",
+		Handler: new(myHandler),
+	}
+	panic(svr.ListenAndServe())
 }
 
 func main() {
