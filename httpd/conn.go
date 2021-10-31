@@ -37,7 +37,8 @@ func (c *conn)Serve(){
 		}
 		c.rawConn.Close()
 	}()
-	//http1.1支持keep-alive长链接，所以一个连接中可能读出多个请求，因此用for循环读取
+	//http1.1支持keep-alive长链接，所以一个连接中可能读出多个请求
+	//多个请求，因此用for循环读取
 	for{
 		req,err := c.readRequest()
 		if err != nil{
@@ -45,9 +46,12 @@ func (c *conn)Serve(){
 			return
 		}
 
-		res := c.setupResponse()
-		c.svr.Handler.ServeHTTP(res,req)
-		if err = req.finishRequest();err != nil{
+		resp := c.setupResponse(req)
+		c.svr.Handler.ServeHTTP(resp,req)
+		if err = req.finishRequest(resp);err != nil{
+			return
+		}
+		if resp.closeAfterReply {
 			return
 		}
 	}
@@ -57,8 +61,8 @@ func (c *conn)readRequest() (*Request,error){
 	return readRequest(c)
 }
 
-func (c *conn)setupResponse()*resonse{
-	return setupResponse(c)
+func (c *conn)setupResponse(req *Request)*response{
+	return setupResponse(c,req)
 }
 
 func (c *conn)close(){

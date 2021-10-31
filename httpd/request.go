@@ -151,13 +151,34 @@ func (r *Request)chunked() bool{
 	如果用户Handler中没有去读取Body的数据，就意味着处理同一个socket连接上的下一个http报文时，Body未消费的数据会干扰下一个报文的解析。
 	所以我们的框架还需要在Handler结束后，将当前http请求的数据给消费掉。给Request增加一个finishRequest方法，以后的一些善尾工作都将交给它：
  */
-func (r *Request) finishRequest() (err error){
+func (r *Request) finishRequest(resp *response) (err error){
 	//用户获取MultipartForm之后，应该调用RemoveAll方法将暂存的文件删除。用户可能在Handler中忘记调用RemoveALL，因此我们在Request的finishRequest方法中做出防备
-	if r.multipartForm!=nil{
+	if r.multipartForm != nil{
 		r.multipartForm.RemoveAll()
 	}
+	//告诉chunkWriter handler已经结束
+	resp.handlerDone = true
+	//触发chunkWriter的Writer方法，Write方法通过handlerDone来决定是用chunk还是Content-Length
+	if err = resp.bufw.Flush();err != nil {
+		return err
+	}
+	//如果是使用chunk编码，还需要将结束标识符传输
+	if resp.chunking {
+		_,err = resp.c.bufw.WriteString("0\r\n\r\n")
+		if err != nil {
+			return err
+		}
+	}
+
+	//如果用户的handler中未Write任何数据，我们手动触发(*chunkWriter).writeHeader
+	if !resp.cw.wrote {
+		resp.header.Set("Content-Length","0")
+		if err = resp.cw.writeHeader(); err != nil {
+			return
+		}
+	}
 	//将缓存中的剩余的数据发送到rwc中
-	if err=r.conn.bufw.Flush();err!=nil{
+	if err = r.conn.bufw.Flush();err!=nil{
 		return
 	}
 	//消费掉剩余的数据
